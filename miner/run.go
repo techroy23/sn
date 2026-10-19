@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -1290,28 +1289,18 @@ func proxyAdd(opts docopt.Opts) {
 	}
 
 	for _, keyAddress := range allKeyAddress {
-		key, proxyAddress := splitProxyKeyAddress(keyAddress, proxyConfig.Auths)
-		if key == "" {
-			// `user:pass@host:port` carries its credentials inline. They are
-			// kept in the `host:port:user:pass` form that readProxySettings
-			// parses, so the address stays one key in the map.
-			if i := strings.Index(keyAddress, "@"); 0 <= i {
-				if credentials := keyAddress[:i]; strings.Contains(credentials, ":") {
-					proxyAddress = proxyAddress + ":" + credentials
-				}
-			}
-		}
-
-		address, user, password := parseProxyAddress(proxyAddress)
+		entry := parseProxyEntry(keyAddress, proxyConfig.Auths)
+		address, user, password := entry.address, entry.user, entry.password
 		if proxyConfig.Auths != nil {
-			proxyAuth, ok := proxyConfig.Auths[key]
+			proxyAuth, ok := proxyConfig.Auths[entry.key]
 			if ok {
 				user = proxyAuth.User
 				password = proxyAuth.Password
 			}
 		}
+		proxyKey := canonicalProxyKey(address, user, password)
 
-		if currentKey, ok := proxyConfig.Servers[proxyAddress]; ok && currentKey != key {
+		if currentKey, ok := proxyConfig.Servers[proxyKey]; ok && currentKey != entry.key {
 			if force, _ := opts.Bool("-f"); !force {
 				fmt.Printf(
 					"server %s (%s/%s) exists with different key. Change key? [yN]\n",
@@ -1335,30 +1324,112 @@ func proxyAdd(opts docopt.Opts) {
 			obfuscatePassword(password),
 		)
 
-		proxyConfig.Servers[proxyAddress] = key
+		proxyConfig.Servers[proxyKey] = entry.key
 	}
 
 	writeProxyConfig(proxyConfig)
 }
 
-// splitProxyKeyAddress separates an optional `key@` prefix from the address.
-// A prefix that names a registered auth key is a key; one that reads as
-// `user:pass` is the proxy's own credential pair, which is how most proxy
-// lists are written. A colon in a key that names no auth is therefore
-// credentials, never a key: the key form exists to reference an Auths entry.
-func splitProxyKeyAddress(keyAddress string, auths map[string]*ProxyAuth) (key string, proxyAddress string) {
-	i := strings.Index(keyAddress, "@")
-	if i < 0 {
-		return "", keyAddress
+// proxyEntry is one proxy list entry after parsing.
+type proxyEntry struct {
+	// key is a registered auth key name, empty for inline credentials.
+	key      string
+	address  string
+	user     string
+	password string
+}
+
+// parseProxyEntry reads one proxy list entry. Two inline credential forms are
+// accepted, and both keep working when a credential contains `:` or `@`:
+//
+//	user:pass@host:port
+//	host:port:user:pass
+//
+// In the first form the split is the last `@` that leaves a `host:port`, so an
+// `@` inside the password is not a separator; the userinfo splits at its first
+// `:`, so the password may contain colons. In the second form the address is
+// the first two fields, the user is the third, and everything after it is the
+// password.
+//
+// A prefix that names a registered auth key is a key and takes precedence,
+// which keeps historical `key@host:port` files working. A prefix with no colon
+// that names no auth stays a key, as it always has.
+func parseProxyEntry(keyAddress string, auths map[string]*ProxyAuth) proxyEntry {
+	keyAddress = strings.TrimSpace(keyAddress)
+	if i := strings.Index(keyAddress, "@"); 0 <= i {
+		prefix := keyAddress[:i]
+		if _, ok := auths[prefix]; ok {
+			return proxyEntry{key: prefix, address: keyAddress[i+1:]}
+		}
 	}
-	prefix := keyAddress[:i]
-	if _, ok := auths[prefix]; ok {
-		return prefix, keyAddress[i+1:]
+	for i := strings.LastIndex(keyAddress, "@"); 0 <= i; i = strings.LastIndex(keyAddress[:i], "@") {
+		if validProxyAddress(keyAddress[i+1:]) {
+			userinfo := keyAddress[:i]
+			if j := strings.Index(userinfo, ":"); 0 <= j {
+				return proxyEntry{
+					address:  keyAddress[i+1:],
+					user:     userinfo[:j],
+					password: userinfo[j+1:],
+				}
+			}
+			return proxyEntry{key: userinfo, address: keyAddress[i+1:]}
+		}
 	}
-	if strings.Contains(prefix, ":") {
-		return "", keyAddress[i+1:]
+	if n := proxyAddressLen(keyAddress); 0 < n && n < len(keyAddress) && keyAddress[n] == ':' {
+		rest := keyAddress[n+1:]
+		if i := strings.Index(rest, ":"); 0 <= i {
+			return proxyEntry{
+				address:  keyAddress[:n],
+				user:     rest[:i],
+				password: rest[i+1:],
+			}
+		}
 	}
-	return prefix, keyAddress[i+1:]
+	return proxyEntry{address: keyAddress}
+}
+
+// canonicalProxyKey is the one shape stored in the proxy config. Credentials
+// live in the key so readProxySettings receives them, and the password keeps
+// everything after the user, so a `:` in it loses no earlier field.
+func canonicalProxyKey(address string, user string, password string) string {
+	if user == "" && password == "" {
+		return address
+	}
+	return address + ":" + user + ":" + password
+}
+
+// proxyAddressLen returns the end of a leading host:port, or 0 when the text
+// does not start with one. A bracketed IPv6 host is one address, not fields.
+func proxyAddressLen(value string) int {
+	hostEnd := 0
+	if strings.HasPrefix(value, "[") {
+		i := strings.Index(value, "]")
+		if i < 0 {
+			return 0
+		}
+		hostEnd = i + 1
+	} else {
+		i := strings.Index(value, ":")
+		if i <= 0 {
+			return 0
+		}
+		hostEnd = i
+	}
+	if len(value) <= hostEnd || value[hostEnd] != ':' {
+		return 0
+	}
+	portEnd := hostEnd + 1
+	for portEnd < len(value) && '0' <= value[portEnd] && value[portEnd] <= '9' {
+		portEnd += 1
+	}
+	if portEnd == hostEnd+1 {
+		return 0
+	}
+	return portEnd
+}
+
+func validProxyAddress(value string) bool {
+	return proxyAddressLen(value) == len(value)
 }
 
 func proxyRemove(opts docopt.Opts) {
@@ -1378,16 +1449,10 @@ func proxyRemove(opts docopt.Opts) {
 		}
 
 		for _, keyAddress := range allKeyAddress {
-			key, address := splitProxyKeyAddress(keyAddress, proxyConfig.Auths)
-			if i := strings.Index(keyAddress, "@"); key == "" && 0 <= i {
-				// the inline credential form is stored colon-form
-				if credentials := keyAddress[:i]; strings.Contains(credentials, ":") {
-					address = address + ":" + credentials
-				}
-			}
-
-			if key == "" || proxyConfig.Servers[address] == key {
-				delete(proxyConfig.Servers, address)
+			entry := parseProxyEntry(keyAddress, proxyConfig.Auths)
+			proxyKey := canonicalProxyKey(entry.address, entry.user, entry.password)
+			if entry.key == "" || proxyConfig.Servers[proxyKey] == entry.key {
+				delete(proxyConfig.Servers, proxyKey)
 			}
 		}
 	}
@@ -1443,17 +1508,8 @@ func readProxySettings() []*connect.ProxySettings {
 }
 
 func parseProxyAddress(proxyAddress string) (address string, user string, password string) {
-	r := regexp.MustCompile("^(.*:\\d*):([^:]*):([^:]*)$")
-	groups := r.FindStringSubmatch(proxyAddress)
-	if groups != nil {
-		address = groups[1]
-		user = groups[2]
-		password = groups[3]
-		return
-	}
-	// assume host:port
-	address = proxyAddress
-	return
+	entry := parseProxyEntry(proxyAddress, nil)
+	return entry.address, entry.user, entry.password
 }
 
 func obfuscateUser(user string) string {
