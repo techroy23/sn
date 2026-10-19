@@ -78,18 +78,18 @@ func (self *providerAuthenticationCallbacks) failure() error {
 
 // These key saves keep their existing best-effort startup semantics. Each real
 // failure remains visible as its own closed event; output never gates serving.
-func persistProviderKeyMaterial(output *providerDiagnostics, provider uint64, keyMaterial *sdk.DeviceLocalKeyMaterial) {
+func persistProviderKeyMaterial(output *providerDiagnostics, provider uint64, proxySettings *connect.ProxySettings, keyMaterial *sdk.DeviceLocalKeyMaterial) {
 	if seed := keyMaterial.GetClientKeySeed(); len(seed) > 0 {
 		if err := writeProviderClientKeySeed(seed); err != nil {
 			output.observe(providerClientKeySaveFailed, provider, true, err, 0, nil)
 		}
 	}
-	persistProviderAuxiliaryKeyMaterial(output, provider, keyMaterial)
+	persistProviderAuxiliaryKeyMaterial(output, provider, proxySettings, keyMaterial)
 }
 
 // Device-generated TLS/extender state cannot overwrite the already owned and
 // fsynced client key that selected the durable registration operation.
-func persistProviderAuxiliaryKeyMaterial(output *providerDiagnostics, provider uint64, keyMaterial *sdk.DeviceLocalKeyMaterial) {
+func persistProviderAuxiliaryKeyMaterial(output *providerDiagnostics, provider uint64, proxySettings *connect.ProxySettings, keyMaterial *sdk.DeviceLocalKeyMaterial) {
 	certPem, keyPem := keyMaterial.GetProvideTlsCertificatePem(), keyMaterial.GetProvideTlsPrivateKeyPem()
 	if len(certPem) > 0 && len(keyPem) > 0 {
 		if err := writeProviderTlsCertAndKey(certPem, keyPem); err != nil {
@@ -97,7 +97,7 @@ func persistProviderAuxiliaryKeyMaterial(output *providerDiagnostics, provider u
 		}
 	}
 	if seed := keyMaterial.GetExtenderKeySeed(); len(seed) > 0 {
-		if err := writeProviderExtenderKeySeed(seed); err != nil {
+		if err := writeProviderExtenderKeySeed(proxySettings, seed); err != nil {
 			output.observe(providerExtenderKeySaveFailed, provider, true, err, 0, nil)
 		}
 	}

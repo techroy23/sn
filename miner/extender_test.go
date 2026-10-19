@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect"
@@ -24,7 +25,7 @@ func TestProviderExtenderKeySeedRoundTrips(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("URNETWORK_STATE_DIR", stateDir)
 
-	extenderKeySeed, err := readProviderExtenderKeySeed()
+	extenderKeySeed, err := readProviderExtenderKeySeed(nil)
 	if err != nil {
 		t.Fatalf("a fresh install failed to read: %s", err)
 	}
@@ -36,10 +37,10 @@ func TestProviderExtenderKeySeedRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeProviderExtenderKeySeed(extenderKeySeed); err != nil {
+	if err := writeProviderExtenderKeySeed(nil, extenderKeySeed); err != nil {
 		t.Fatal(err)
 	}
-	restoredKeySeed, err := readProviderExtenderKeySeed()
+	restoredKeySeed, err := readProviderExtenderKeySeed(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +69,82 @@ func TestProviderExtenderKeySeedRoundTrips(t *testing.T) {
 	clientKeySeedBytes, err := os.ReadFile(filepath.Join(stateDir, ".provider.key"))
 	if err == nil {
 		t.Fatalf("the extender seed was written as the client key seed: %v", clientKeySeedBytes)
+	}
+}
+
+// One run holds many provider slots, and every slot runs its own gossip node.
+// A single seed shared by those nodes makes them one mesh peer: they drop each
+// other's publications, and the ones that reach the operator under that id
+// supersede each other's address set as fast as they publish. Each slot keeps
+// its own identity, stable across launches, and no two slots share one.
+func TestProviderExtenderKeySeedIsPerSlot(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("URNETWORK_STATE_DIR", stateDir)
+
+	first := &connect.ProxySettings{Network: "tcp", Address: "127.0.0.1:9001"}
+	second := &connect.ProxySettings{Network: "tcp", Address: "127.0.0.1:9002"}
+	firstPath, err := providerExtenderKeyPath(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPath, err := providerExtenderKeyPath(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directPath, err := providerExtenderKeyPath(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstPath == secondPath || firstPath == directPath || secondPath == directPath {
+		t.Fatalf("slots share an extender identity file: %s %s %s", firstPath, secondPath, directPath)
+	}
+	// a slot's identity is stable across launches, so the operator keeps the
+	// peer id its record names
+	again, err := providerExtenderKeyPath(&connect.ProxySettings{Network: "tcp", Address: "127.0.0.1:9001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != firstPath {
+		t.Fatalf("the same slot moved from %s to %s", firstPath, again)
+	}
+
+	firstSeed, err := connect.NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSeed, err := connect.NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProviderExtenderKeySeed(first, firstSeed); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProviderExtenderKeySeed(second, secondSeed); err != nil {
+		t.Fatal(err)
+	}
+	restoredFirst, err := readProviderExtenderKeySeed(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredSecond, err := readProviderExtenderKeySeed(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restoredFirst, firstSeed) || !bytes.Equal(restoredSecond, secondSeed) {
+		t.Fatal("one slot's identity overwrote another's")
+	}
+	// a proxy's credentials never enter the filename
+	if base := filepath.Base(firstPath); strings.Contains(base, "127.0.0.1") {
+		t.Fatalf("the extender identity file names its proxy: %s", base)
+	}
+	for _, path := range []string{firstPath, secondPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0600 {
+			t.Fatalf("mode = %o, expected 0600", mode)
+		}
 	}
 }
 

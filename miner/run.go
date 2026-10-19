@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -833,8 +834,16 @@ func (self providerRunSettings) run(parent context.Context, writer io.Writer) (r
 		}()
 
 		certPem, keyPem, _ := readProviderTlsCertAndKey()
-		extenderKeySeed, _ := readProviderExtenderKeySeed()
+		extenderKeySeed, _ := readProviderExtenderKeySeed(proxySettings)
 		settings := ProviderDeviceSettings(self.closeReportDomainHash)
+		// The extender role binds this host's carrier ports and publishes this
+		// host's address, and it can do neither more than once per process: a
+		// second space's bind fails and its record names an address the host
+		// does not hold (an egress proxy's). Every slot of one run therefore
+		// competes for one role, and only the direct slot can honestly hold it
+		// -- the same rule the swarm members and hosted devices follow. The
+		// remaining slots still provide; they just do not listen.
+		settings.ProvideExtenderEnabled = proxySettings == nil
 		settings.KeyMaterial = sdk.NewDeviceLocalKeyMaterial(seed, certPem, keyPem)
 		// the extender identity of this provider (connect/EXTENDER.md B1, G2).
 		// The space keeps no local state, so the seed lives here: without it
@@ -878,7 +887,7 @@ func (self providerRunSettings) run(parent context.Context, writer io.Writer) (r
 		if !bytes.Equal(keyMaterial.GetClientKeySeed(), seed) {
 			return errors.New("provider device changed its retained registration key")
 		}
-		persistProviderAuxiliaryKeyMaterial(output, index, keyMaterial)
+		persistProviderAuxiliaryKeyMaterial(output, index, proxySettings, keyMaterial)
 		observeProviderExtenderIdentity(output, index, keyMaterial.GetExtenderKeySeed())
 		// one line per change, so the activation prints once it settles and
 		// nothing repeats while it holds (connect/EXTENDER.md F3, G3)
@@ -975,6 +984,16 @@ func providerStateDir() (string, error) {
 	return filepath.Join(home, ".urnetwork"), nil
 }
 
+// providerSlotDigest names one provider slot: the direct provider, or a proxy
+// by its network and address. Proxy credentials never enter a filename.
+func providerSlotDigest(proxySettings *connect.ProxySettings) string {
+	if proxySettings == nil {
+		return "direct"
+	}
+	sum := sha256.Sum256([]byte(proxySettings.Network + "\x00" + proxySettings.Address))
+	return hex.EncodeToString(sum[:8])
+}
+
 // Resolves one file in the selected state directory without creating it.
 func providerStatePath(name string) (string, error) {
 	dir, err := providerStateDir()
@@ -992,9 +1011,21 @@ func providerClientJwtPath(proxySettings *connect.ProxySettings) (string, error)
 	if proxySettings == nil {
 		return providerStatePath(".provider.jwt")
 	}
-	key := proxySettings.Network + "\x00" + proxySettings.Address
-	sum := sha256.Sum256([]byte(key))
-	return providerStatePath(fmt.Sprintf(".provider-%x.jwt", sum[:8]))
+	return providerStatePath(fmt.Sprintf(".provider-%s.jwt", providerSlotDigest(proxySettings)))
+}
+
+// providerExtenderKeyPath gives each provider slot its own extender identity.
+// The identity also names the space's gossip peer, and one process runs one
+// gossip node per slot. A single file shared by every slot made those nodes
+// present one peer id to the mesh: they ignore each other's publications, and
+// the ones that reach the operator under that id supersede each other's
+// address set as fast as they publish. A slot keeps one identity across
+// launches so an activated extender keeps the id its record names.
+func providerExtenderKeyPath(proxySettings *connect.ProxySettings) (string, error) {
+	if proxySettings == nil {
+		return providerStatePath(".provider.extender.key")
+	}
+	return providerStatePath(fmt.Sprintf(".provider.extender-%s.key", providerSlotDigest(proxySettings)))
 }
 
 // readProviderClientKeySeed loads the Ed25519 seed for the provider
@@ -1028,13 +1059,14 @@ func writeProviderClientKeySeed(seed []byte) error {
 	return os.WriteFile(p, seed, 0600)
 }
 
-// readProviderExtenderKeySeed loads the ed25519 seed of this provider's
-// extender identity from `~/.urnetwork/.provider.extender.key`
-// (connect/EXTENDER.md B1). Returns (nil, nil) when the file does not exist --
-// a provider that has not been an extender yet. The file is the raw 32-byte
-// seed; no encoding, exactly as the client key seed beside it.
-func readProviderExtenderKeySeed() ([]byte, error) {
-	p, err := providerStatePath(".provider.extender.key")
+// readProviderExtenderKeySeed loads the ed25519 seed of this provider slot's
+// extender identity from its state file -- `.provider.extender.key` for the
+// direct provider, one per proxy slot otherwise (connect/EXTENDER.md B1).
+// Returns (nil, nil) when the file does not exist -- a slot that has not been
+// an extender yet. The file is the raw 32-byte seed; no encoding, exactly as
+// the client key seed beside it.
+func readProviderExtenderKeySeed(proxySettings *connect.ProxySettings) ([]byte, error) {
+	p, err := providerExtenderKeyPath(proxySettings)
 	if err != nil {
 		return nil, err
 	}
@@ -1045,12 +1077,12 @@ func readProviderExtenderKeySeed() ([]byte, error) {
 	return b, err
 }
 
-// writeProviderExtenderKeySeed persists the extender identity seed to
-// `~/.urnetwork/.provider.extender.key` with 0600 permissions (sensitive
+// writeProviderExtenderKeySeed persists the extender identity seed of one
+// provider slot to its state file with 0600 permissions (sensitive
 // material -- anyone with this file can present this host's extender identity
 // to the mesh and to the operator).
-func writeProviderExtenderKeySeed(extenderKeySeed []byte) error {
-	p, err := providerStatePath(".provider.extender.key")
+func writeProviderExtenderKeySeed(proxySettings *connect.ProxySettings, extenderKeySeed []byte) error {
+	p, err := providerExtenderKeyPath(proxySettings)
 	if err != nil {
 		return err
 	}
@@ -1258,15 +1290,16 @@ func proxyAdd(opts docopt.Opts) {
 	}
 
 	for _, keyAddress := range allKeyAddress {
-		var key string
-		var proxyAddress string
-		i := strings.Index(keyAddress, "@")
-		if 0 <= i {
-			key = keyAddress[:i]
-			proxyAddress = keyAddress[i+1:]
-		} else {
-			key = ""
-			proxyAddress = keyAddress
+		key, proxyAddress := splitProxyKeyAddress(keyAddress, proxyConfig.Auths)
+		if key == "" {
+			// `user:pass@host:port` carries its credentials inline. They are
+			// kept in the `host:port:user:pass` form that readProxySettings
+			// parses, so the address stays one key in the map.
+			if i := strings.Index(keyAddress, "@"); 0 <= i {
+				if credentials := keyAddress[:i]; strings.Contains(credentials, ":") {
+					proxyAddress = proxyAddress + ":" + credentials
+				}
+			}
 		}
 
 		address, user, password := parseProxyAddress(proxyAddress)
@@ -1308,6 +1341,26 @@ func proxyAdd(opts docopt.Opts) {
 	writeProxyConfig(proxyConfig)
 }
 
+// splitProxyKeyAddress separates an optional `key@` prefix from the address.
+// A prefix that names a registered auth key is a key; one that reads as
+// `user:pass` is the proxy's own credential pair, which is how most proxy
+// lists are written. A colon in a key that names no auth is therefore
+// credentials, never a key: the key form exists to reference an Auths entry.
+func splitProxyKeyAddress(keyAddress string, auths map[string]*ProxyAuth) (key string, proxyAddress string) {
+	i := strings.Index(keyAddress, "@")
+	if i < 0 {
+		return "", keyAddress
+	}
+	prefix := keyAddress[:i]
+	if _, ok := auths[prefix]; ok {
+		return prefix, keyAddress[i+1:]
+	}
+	if strings.Contains(prefix, ":") {
+		return "", keyAddress[i+1:]
+	}
+	return prefix, keyAddress[i+1:]
+}
+
 func proxyRemove(opts docopt.Opts) {
 	proxyConfig := readProxyConfig()
 
@@ -1325,15 +1378,12 @@ func proxyRemove(opts docopt.Opts) {
 		}
 
 		for _, keyAddress := range allKeyAddress {
-			var key string
-			var address string
-			i := strings.Index(keyAddress, "@")
-			if 0 <= i {
-				key = keyAddress[:i]
-				address = keyAddress[i+1:]
-			} else {
-				key = ""
-				address = keyAddress
+			key, address := splitProxyKeyAddress(keyAddress, proxyConfig.Auths)
+			if i := strings.Index(keyAddress, "@"); key == "" && 0 <= i {
+				// the inline credential form is stored colon-form
+				if credentials := keyAddress[:i]; strings.Contains(credentials, ":") {
+					address = address + ":" + credentials
+				}
 			}
 
 			if key == "" || proxyConfig.Servers[address] == key {
